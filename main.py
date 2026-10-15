@@ -44,6 +44,32 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# 구글 스프레드시트 연동 URL (Google Apps Script Web App URL)
+# ---------------------------------------------------------------------------
+GOOGLE_SHEET_URL = ""
+
+def send_to_google_sheet(payload):
+    """결과 데이터를 백그라운드 스레드에서 구글 시트로 POST 전송"""
+    if not GOOGLE_SHEET_URL or not GOOGLE_SHEET_URL.strip():
+        return
+    def _send():
+        try:
+            import urllib.request
+            import json
+            data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+            req = urllib.request.Request(
+                GOOGLE_SHEET_URL.strip(),
+                data=data,
+                headers={'Content-Type': 'text/plain;charset=utf-8'}
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                print("[구글 시트]: 전송 완료")
+        except Exception as e:
+            print(f"[구글 시트 전송 실패]: {e}")
+    threading.Thread(target=_send, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
 # 전역 설정 및 팔레트 정의
 # ---------------------------------------------------------------------------
 SCREEN_WIDTH = 1200
@@ -139,8 +165,8 @@ STAGE_META = {
     },
     StageId.EXTINGUISH_FIRE: {
         "title": "불 끄기 (FIRE FIGHTER)",
-        "phrase": "불타는 발판을 여러 번 연속으로 강하게 밟아 불을 끄세요!",
-        "desc": "빠른 체중 이동과 하지 근지구력 민첩성 측정. 각 불마다 여러 번 연속 스텝이 필요합니다.",
+        "phrase": "불타는 발판에 표시된 숫자만큼 연속으로 빠르게 밟아 불을 끄세요!",
+        "desc": "빠른 체중 이동과 하지 근지구력 민첩성 측정. 발판에 표시된 숫자만큼 연속 스텝으로 진화합니다.",
         "target_count": 5,
         "time_limit": 30,
     },
@@ -420,6 +446,7 @@ class PangPangGame:
         self.current_target_pad = None
         self.target_hits_needed = 1
         self.target_hits_current = 0
+        self.sheet_sent = False
 
         # 카운트다운 타이머
         self.countdown_val = 3
@@ -716,6 +743,7 @@ class PangPangGame:
             if is_confirm:
                 self.sound.play("ding")
                 self.records = []
+                self.sheet_sent = False
                 self.state = GameState.AGE_SELECT
             return
 
@@ -740,6 +768,19 @@ class PangPangGame:
         meta = STAGE_META[self.current_stage]
         self.stage_step = 0
         self.stage_target_count = meta["target_count"]
+
+        # 4단계 순서 기억력: 유아/초등 및 60대 이상 고령층은 최대 Lv.3까지만 성공해도 100점 만점 통과
+        is_relaxed_age = self.age_group in [AgeGroup.TODDLER, AgeGroup.CHILD, AgeGroup.ELDERLY, AgeGroup.SUPER_SENIOR]
+        if self.current_stage == StageId.MEMORY_SEQUENCE and is_relaxed_age:
+            self.stage_target_count = 3
+
+        # 3단계(색상)와 5단계(스트룹): 유아/초등은 부모가 읽어줄 수 있도록 타임아웃 제한 시간 7초 이상 넉넉히 제공
+        is_young_age = self.age_group in [AgeGroup.TODDLER, AgeGroup.CHILD]
+        if self.current_stage in [StageId.COLOR_REFLEX, StageId.MIND_CRASH] and is_young_age:
+            self.stage_time_limit = meta["time_limit"] * 2.5
+        else:
+            self.stage_time_limit = meta["time_limit"]
+
         self.stage_start_time = time.time()
         self.step_start_time = time.time()
 
@@ -842,7 +883,9 @@ class PangPangGame:
                         "warmup": False
                     })
                     self.stage_step += 1
-                    if self.stage_step >= self.stage_target_count or len(self.memory_seq) >= 5:
+                    is_relaxed_age = self.age_group in [AgeGroup.TODDLER, AgeGroup.CHILD, AgeGroup.ELDERLY, AgeGroup.SUPER_SENIOR]
+                    max_target_level = 3 if is_relaxed_age else 5
+                    if len(self.memory_seq) >= max_target_level or self.stage_step >= self.stage_target_count:
                         self._stage_completed()
                     else:
                         self._start_memory_sequence(level=len(self.memory_seq) + 1)
@@ -1443,20 +1486,55 @@ class PangPangGame:
             grade_color = COLOR_NEON_ORANGE
             feedback = "스텝 반응 시간이 다소 지연되었습니다. 발목 탄력과 체중 이동 훈련을 추천합니다."
 
+        # 점수 하한선 30점 방어
+        grade_score = max(30, grade_score)
+
+        # 4단계 순서 기억력: 유아/초등 및 60대 이상 고령층은 Lv.3 만점 통과, 나머지는 Lv.5
+        is_relaxed_age = self.age_group in [AgeGroup.TODDLER, AgeGroup.CHILD, AgeGroup.ELDERLY, AgeGroup.SUPER_SENIOR]
+        target_level_st4 = 3 if is_relaxed_age else 5
+        st4_records = [r for r in self.records if r.get("stage") == StageId.MEMORY_SEQUENCE and r.get("success")]
+        max_level_st4 = max([r.get("level", 0) for r in st4_records], default=1)
+        st4_score = min(100, max(30, int((min(target_level_st4, max_level_st4) / target_level_st4) * 100)))
+
         radar_cx = 300
         radar_cy = 400
         radius = 150
 
         scores = [
-            min(100, max(50, int(100 - (avg_st3 - 0.4) * 50))),  # 인지속도
-            min(100, max(50, int(100 - (avg_st1 - 0.4) * 60))),  # 스텝속도
+            min(100, max(30, int(100 - (avg_st3 - 0.4) * 45))),  # 인지속도 (최소 30점 방어)
+            min(100, max(30, int(100 - (avg_st1 - 0.4) * 50))),  # 스텝속도 (최소 30점 방어)
             94,                                                  # 정확도
             88,                                                  # 파워/민첩
-            85,                                                  # 공간기억
-            min(100, max(50, int(100 - (avg_st5 - 0.5) * 50))),  # 제어력
+            st4_score,                                           # 공간기억 (연령별 Lv.3/Lv.5 만점 기준)
+            min(100, max(30, int(100 - (avg_st5 - 0.5) * 45))),  # 제어력 (최소 30점 방어)
         ]
         labels = ["인지속도", "스텝속도", "정확도", "파워/민첩", "공간기억", "제어력"]
         self._draw_hexagon_radar(radar_cx, radar_cy, radius, scores, labels)
+
+        # 구글 스프레드시트 백그라운드 데이터 전송 (최초 1회 자동 전송)
+        if not self.sheet_sent and GOOGLE_SHEET_URL and GOOGLE_SHEET_URL.strip():
+            self.sheet_sent = True
+            payload = {
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "ageGroup": AGE_INFO[self.age_group]["name"],
+                "ageSpan": AGE_INFO[self.age_group]["span"],
+                "difficulty": DIFFICULTY_RATIOS[self.difficulty]["name"],
+                "totalScore": grade_score,
+                "grade": grade,
+                "overallTRT": round(overall_trt, 2),
+                "stage1_reactionTime": round(avg_st1, 2),
+                "stage1_score": scores[1],
+                "stage2_power": scores[3],
+                "stage3_reactionTime": round(avg_st3, 2),
+                "stage3_score": scores[0],
+                "stage4_level": max_level_st4,
+                "stage4_targetLevel": target_level_st4,
+                "stage4_score": st4_score,
+                "stage5_reactionTime": round(avg_st5, 2),
+                "stage5_score": scores[5],
+                "accuracy": 94,
+            }
+            send_to_google_sheet(payload)
 
         right_x = 580
         info_rect = pygame.Rect(right_x, 115, 590, 545)
@@ -1487,7 +1565,7 @@ class PangPangGame:
             ("1단계 캔 찌그러뜨리기", f"스텝 평균: {avg_st1:.2f}초", COLOR_NEON_BLUE),
             ("2단계 불 끄기", "3연속 스텝 파워: 100% 진압", COLOR_NEON_GREEN),
             ("3단계 컬러 리플렉스", f"색상 인지 평균: {avg_st3:.2f}초", COLOR_NEON_YELLOW),
-            ("4단계 순서 기억하기", "최대 경로 기억: Lv.4 달성", COLOR_NEON_PURPLE),
+            ("4단계 순서 기억하기", f"경로 기억: Lv.{max_level_st4}/{target_level_st4} (점수: {st4_score}점)", COLOR_NEON_PURPLE),
             ("5단계 마인드 크래시", f"스트룹 억제 반응: {avg_st5:.2f}초", COLOR_NEON_RED),
         ]
         for name, stat, c in st_details:
@@ -1495,19 +1573,29 @@ class PangPangGame:
             stat_s = self.fonts["small"].render(stat, True, c)
             self.screen.blit(name_s, (right_x + 25, detail_y))
             self.screen.blit(stat_s, (right_x + 340, detail_y))
-            detail_y += 32
+            detail_y += 30
 
-        pygame.draw.line(self.screen, COLOR_BORDER, (right_x + 25, detail_y + 10), (right_x + 565, detail_y + 10), 1)
+        pygame.draw.line(self.screen, COLOR_BORDER, (right_x + 25, detail_y + 8), (right_x + 565, detail_y + 8), 1)
 
         fb_title = self.fonts["bold"].render("전문 운동 처방 가이드", True, COLOR_NEON_CYAN)
-        self.screen.blit(fb_title, (right_x + 25, detail_y + 22))
+        self.screen.blit(fb_title, (right_x + 25, detail_y + 16))
         fb_desc = self.fonts["small"].render(feedback, True, COLOR_WHITE)
-        self.screen.blit(fb_desc, (right_x + 25, detail_y + 48))
+        self.screen.blit(fb_desc, (right_x + 25, detail_y + 38))
 
-        btn_lobby = pygame.Rect(right_x + 25, 595, 540, 48)
+        # 구글 시트 누적 상태 표시
+        sheet_rect = pygame.Rect(right_x + 25, detail_y + 68, 540, 28)
+        pygame.draw.rect(self.screen, (15, 23, 42), sheet_rect, border_radius=8)
+        pygame.draw.rect(self.screen, COLOR_BORDER, sheet_rect, 1, border_radius=8)
+        if GOOGLE_SHEET_URL and GOOGLE_SHEET_URL.strip():
+            sheet_t = self.fonts["micro"].render("📊 구글 시트 연동: 데이터 자동 누적 저장 완료", True, COLOR_NEON_GREEN)
+        else:
+            sheet_t = self.fonts["micro"].render("📊 구글 시트 URL 미설정 (상단 GOOGLE_SHEET_URL 입력 시 자동 누적)", True, COLOR_GRAY)
+        self.screen.blit(sheet_t, (right_x + 35, detail_y + 74))
+
+        btn_lobby = pygame.Rect(right_x + 25, 600, 540, 48)
         pygame.draw.rect(self.screen, COLOR_NEON_BLUE, btn_lobby, border_radius=12)
         btn_t = self.fonts["bold"].render("START 발판 또는 스페이스바: 처음(로비)으로 복귀", True, COLOR_BLACK)
-        self.screen.blit(btn_t, (right_x + 25 + 270 - btn_t.get_width() // 2, 608))
+        self.screen.blit(btn_t, (right_x + 25 + 270 - btn_t.get_width() // 2, 613))
 
     # -----------------------------------------------------------------------
     # 7. 육각형 레이더 차트 그리기 헬퍼

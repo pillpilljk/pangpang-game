@@ -16,13 +16,16 @@ import {
   COLORS,
   AGE_BENCHMARKS,
   DIFFICULTY_CONFIG,
-  get_scaled_benchmark
+  get_scaled_benchmark,
+  get_stage4_target_level
 } from './constants';
 import { serialService } from './services/serialService';
 import { audioService } from './services/audioService';
+import { storageService } from './services/storageService';
 import { ConnectionStatus } from './components/ConnectionStatus';
 import { Board } from './components/Board';
 import { Report } from './components/Report';
+import { AdminRecordsModal } from './components/AdminRecordsModal';
 import { 
   Settings, 
   Target, 
@@ -36,12 +39,15 @@ import {
   UserRound,
   ArrowRightCircle,
   Gauge,
-  Footprints
+  Footprints,
+  Home,
+  FileSpreadsheet
 } from 'lucide-react';
 
 const App: React.FC = () => {
   // Global State
   const [gameState, setGameState] = useState<GameState>(GameState.AGE_SELECTION);
+  const [isAdminRecordsOpen, setIsAdminRecordsOpen] = useState(false);
   const [selectedAge, setSelectedAge] = useState<AgeGroup>(AgeGroup.YOUTH);
   const [difficulty, setDifficulty] = useState<BenchmarkDifficulty>(BenchmarkDifficulty.NORMAL);
   const [currentStage, setCurrentStage] = useState<StageId>(StageId.CAN_CRUSH);
@@ -152,10 +158,18 @@ const App: React.FC = () => {
 
   const startActualPlay = useCallback(() => {
     setGameState(GameState.PLAYING);
-    setTimeLeft(settings[currentStage].timeLimit);
+    let timeLimit = settings[currentStage].timeLimit;
+    // 유아/초등 연령대는 3단계(색상)와 5단계(인지 갈등)에서 부모가 옆에서 읽어줄 수 있도록 타임아웃 제한 시간을 7초 이상으로 넉넉하게 확장
+    if (
+      (currentStage === StageId.COLOR_REFLEX || currentStage === StageId.MIND_CRASH) &&
+      (selectedAge === AgeGroup.TODDLER || selectedAge === AgeGroup.CHILD)
+    ) {
+      timeLimit = Math.max(timeLimit, settings[currentStage].targetCount * 8); // 80초 이상 (문제당 8초 확보)
+    }
+    setTimeLeft(timeLimit);
     lastProcessedInputs.current = { ...gameRefs.current.inputs };
     if (currentStage !== StageId.MEMORY_SEQUENCE) startTimeRef.current = Date.now();
-  }, [currentStage, settings]);
+  }, [currentStage, settings, selectedAge]);
 
   const playSequenceVisuals = useCallback(async (seq: number[]) => {
     setIsWatchingSequence(true);
@@ -189,8 +203,11 @@ const App: React.FC = () => {
   );
 
   const spawnTarget = useCallback(() => {
-    const { currentStage: stage, score: s, settings: set, sequence: seq } = gameRefs.current;
-    if (s >= set[stage].targetCount) return;
+    const { currentStage: stage, score: s, settings: set, sequence: seq, selectedAge: currentAge } = gameRefs.current;
+    const maxTargetCount = stage === StageId.MEMORY_SEQUENCE
+      ? get_stage4_target_level(currentAge)
+      : set[stage].targetCount;
+    if (s >= maxTargetCount) return;
     audioService.playSpawn();
 
     if (stage === StageId.CAN_CRUSH) {
@@ -308,7 +325,22 @@ const App: React.FC = () => {
   }, []);
 
   const resetGameToLobby = useCallback(() => {
+    if (timerRef.current) clearInterval(timerRef.current);
+    audioService.stopBGM();
     setRecords([]);
+    setTargets([]);
+    setTargetHealth({});
+    setTargetContent({});
+    setPadColors({});
+    setActiveGoalColor(null);
+    setActiveGoalDisplayHex(null);
+    setSequence([]);
+    setSequencePlayerIdx(0);
+    setDisplayingSequence(null);
+    setIsWatchingSequence(false);
+    setStage5CorrectPads([]);
+    setScore(0);
+    setStageCompletedCount(0);
     setGameState(GameState.AGE_SELECTION);
   }, []);
 
@@ -473,6 +505,13 @@ const App: React.FC = () => {
     });
     serialService.onStatusChange(setConnected);
     const handleKD = (e: KeyboardEvent) => {
+      // 관리자 단축키: Ctrl + Shift + D 또는 F9 누르면 오프라인 참가자 데이터 모달 및 CSV 다운로드 관리창 열림
+      if (((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'D' || e.key === 'd')) || e.key === 'F9') {
+        e.preventDefault();
+        setIsAdminRecordsOpen(prev => !prev);
+        return;
+      }
+
       const keyMap: any = { '7': 1, '8': 2, '9': 3, '4': 4, '5': 5, '6': 6, '1': 7, '2': 8, '3': 9, 'a': 10, 'b': 11, ' ': 11, 'Enter': 11 };
       if (keyMap[e.key]) handleBoardInput(keyMap[e.key], true);
     };
@@ -534,11 +573,15 @@ const App: React.FC = () => {
   }, [gameState]);
 
   useEffect(() => {
-    if (score >= settings[currentStage].targetCount && gameState === GameState.PLAYING) {
+    const maxTargetCount = currentStage === StageId.MEMORY_SEQUENCE 
+      ? get_stage4_target_level(selectedAge) 
+      : settings[currentStage].targetCount;
+
+    if (score >= maxTargetCount && gameState === GameState.PLAYING) {
       audioService.playClear();
       setGameState(GameState.STAGE_CLEAR);
     }
-  }, [score, currentStage, gameState, settings]);
+  }, [score, currentStage, gameState, settings, selectedAge]);
 
   useEffect(() => {
     if (gameState === GameState.PLAYING && !isWatchingSequence) {
@@ -552,7 +595,44 @@ const App: React.FC = () => {
 
   return (
     <div className={`h-screen w-screen overflow-hidden relative p-2 md:p-3 flex flex-col justify-between transition-transform duration-100 select-none ${shake ? 'shake' : ''}`}>
+      {/* 각 차시별 처음으로 돌아가기 버튼 (구석 배치, 마우스 클릭으로만 동작) */}
+      {gameState !== GameState.AGE_SELECTION && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            audioService.playClick();
+            resetGameToLobby();
+          }}
+          className="fixed top-3 left-3 z-50 flex items-center gap-1.5 px-3 py-1.5 bg-slate-900/90 hover:bg-rose-950/90 text-slate-200 hover:text-white border border-slate-700 hover:border-rose-500 rounded-xl shadow-2xl backdrop-blur-md text-xs font-bold orbitron transition-all cursor-pointer group active:scale-95 select-none"
+          title="마우스로 클릭하여 처음 시작 화면(연령 선택)으로 돌아갑니다 (키보드/발판 미동작)"
+        >
+          <Home size={14} className="text-rose-400 group-hover:scale-110 transition-transform" />
+          <span>처음으로</span>
+          <span className="text-[9px] text-slate-400 group-hover:text-rose-200 font-normal hidden sm:inline">(마우스 전용)</span>
+        </button>
+      )}
+
+      {/* 우측 상단 시리얼 연결 상태 */}
       <ConnectionStatus connected={connected} onConnect={() => serialService.connect()} />
+
+      {/* 좌측 하단 관리자 오프라인 데이터/CSV 다운로드 숨김 버튼 */}
+      <button
+        type="button"
+        onClick={() => setIsAdminRecordsOpen(true)}
+        className="fixed bottom-2.5 left-2.5 z-40 flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-slate-900/40 hover:bg-slate-900/90 text-slate-500 hover:text-slate-200 border border-slate-800/60 hover:border-sky-500/50 text-[10px] font-bold orbitron opacity-25 hover:opacity-100 transition-all cursor-pointer select-none backdrop-blur-sm"
+        title="관리자: 누적 참가자 기록 확인 및 엑셀 CSV 다운로드 (단축키: Ctrl+Shift+D)"
+      >
+        <FileSpreadsheet size={13} className="text-sky-400" />
+        <span className="hidden sm:inline">참가자 데이터</span>
+        <span className="text-[9px] text-slate-500 font-mono">[Ctrl+Shift+D]</span>
+      </button>
+
+      {/* 관리자 오프라인 기록 및 CSV 다운로드 모달 */}
+      <AdminRecordsModal
+        isOpen={isAdminRecordsOpen}
+        onClose={() => setIsAdminRecordsOpen(false)}
+      />
       
       {gameState === GameState.AGE_SELECTION && (
         <div className="flex flex-col items-center justify-center h-full max-h-screen overflow-hidden py-1 px-3 animate-in fade-in zoom-in duration-500">
@@ -793,9 +873,17 @@ const App: React.FC = () => {
           {/* Top Bar */}
           <div className="w-full max-w-6xl mx-auto flex justify-between items-center px-4 py-1.5 border-b border-slate-800 shrink-0 h-11">
             <div>
-              <p className="text-[10px] font-bold text-sky-400 orbitron uppercase">
-                STAGE 0{currentStage} | {AGE_BENCHMARKS[selectedAge].name} ({DIFFICULTY_CONFIG[difficulty].label})
-              </p>
+              <div className="flex items-center gap-2">
+                <p className="text-[10px] font-bold text-sky-400 orbitron uppercase">
+                  STAGE 0{currentStage} | {AGE_BENCHMARKS[selectedAge].name} ({DIFFICULTY_CONFIG[difficulty].label})
+                </p>
+                {(currentStage === StageId.COLOR_REFLEX || currentStage === StageId.MIND_CRASH) && 
+                 (selectedAge === AgeGroup.TODDLER || selectedAge === AgeGroup.CHILD) && (
+                  <span className="px-2 py-0.5 bg-amber-500/20 text-amber-300 border border-amber-500/40 rounded-full text-[9px] font-bold orbitron">
+                    👨‍👩‍👧 부모 안내 모드 (문제당 8초+ 제공)
+                  </span>
+                )}
+              </div>
               <h2 className="text-lg md:text-xl font-black orbitron italic text-white tracking-widest leading-none">
                 {STAGE_TITLES[currentStage]}
               </h2>
@@ -807,9 +895,13 @@ const App: React.FC = () => {
                 </p>
                 <p className="text-xl md:text-2xl font-black orbitron text-white leading-none">
                   {stageCompletedCount === 0 ? (
-                    <span className="text-amber-400 text-sm md:text-base font-bold">연습 중 (0/{settings[currentStage].targetCount})</span>
+                    <span className="text-amber-400 text-sm md:text-base font-bold">
+                      연습 중 (0/{currentStage === StageId.MEMORY_SEQUENCE ? get_stage4_target_level(selectedAge) : settings[currentStage].targetCount})
+                    </span>
                   ) : (
-                    <span>{score} / {settings[currentStage].targetCount}</span>
+                    <span>
+                      {score} / {currentStage === StageId.MEMORY_SEQUENCE ? get_stage4_target_level(selectedAge) : settings[currentStage].targetCount}
+                    </span>
                   )}
                 </p>
               </div>
@@ -1129,6 +1221,38 @@ const App: React.FC = () => {
               );
             })}
           </div>
+          {/* 오프라인 참가자 데이터 관리 */}
+          <div className="mt-6 p-4 bg-slate-800/90 rounded-2xl border border-emerald-500/40">
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-2">
+                <FileSpreadsheet className="text-emerald-400" size={18} />
+                <h4 className="font-bold orbitron text-white text-sm">오프라인 참가자 데이터 관리</h4>
+              </div>
+              <span className="text-xs font-black text-amber-400 orbitron">
+                누적 {storageService.getRecordCount()}명
+              </span>
+            </div>
+            <p className="text-xs text-slate-400 mb-3">
+              인터넷 없이도 브라우저 localStorage에 누적된 모든 참가자 측정 기록을 엑셀 CSV 파일로 다운로드합니다.
+            </p>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => storageService.exportToCSV()}
+                className="flex-1 flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl bg-gradient-to-r from-emerald-500 to-sky-500 hover:from-emerald-400 hover:to-sky-400 text-slate-950 font-black text-xs orbitron shadow-md transition-all cursor-pointer"
+              >
+                <FileSpreadsheet size={15} /> 엑셀 CSV 파일 다운로드
+              </button>
+              <button
+                type="button"
+                onClick={() => setIsAdminRecordsOpen(true)}
+                className="py-2.5 px-4 rounded-xl bg-slate-900 hover:bg-slate-700 text-slate-300 font-bold text-xs orbitron border border-slate-700 transition-all cursor-pointer"
+              >
+                상세 보기
+              </button>
+            </div>
+          </div>
+
           <button onClick={() => setGameState(GameState.LOBBY)} className="w-full mt-6 bg-sky-600 hover:bg-sky-500 text-white font-bold py-3.5 rounded-2xl orbitron transition-all cursor-pointer">SAVE SETTINGS</button>
         </div>
       )}

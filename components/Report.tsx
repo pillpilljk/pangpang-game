@@ -8,8 +8,10 @@ import {
   calculate_speed_score, 
   get_grade, 
   GRADE_DETAILS, 
-  STAGE_TITLES 
+  STAGE_TITLES,
+  get_stage4_target_level
 } from '../constants';
+import { storageService } from '../services/storageService';
 import { 
   RotateCcw, 
   Share2, 
@@ -30,7 +32,10 @@ import {
   TableProperties, 
   Zap, 
   Layers,
-  Gauge
+  Gauge,
+  FileSpreadsheet,
+  Download,
+  HardDrive
 } from 'lucide-react';
 
 interface Props {
@@ -52,6 +57,10 @@ export const Report: React.FC<Props> = ({
 }) => {
   const [activeTab, setActiveTab] = useState<'overview' | 'benchmarks' | 'stages'>('overview');
   const [copied, setCopied] = useState(false);
+  const [downloaded, setDownloaded] = useState(false);
+  const [savedRecord, setSavedRecord] = useState<any>(null);
+  const [cumulativeCount, setCumulativeCount] = useState<number>(() => storageService.getRecordCount());
+  const hasSavedRef = React.useRef(false);
 
   const benchmark = get_scaled_benchmark(ageGroup, difficulty);
   const diffOption = DIFFICULTY_CONFIG[difficulty] || DIFFICULTY_CONFIG[BenchmarkDifficulty.NORMAL];
@@ -120,13 +129,17 @@ export const Report: React.FC<Props> = ({
     const time_gap = allReactionTimes.length > 1 ? worstReactionTime - bestReactionTime : 0;
     const totalAccuracy = records.length > 0 ? (correctRecords.length / records.length) * 100 : 100;
 
-    // Multi-dimensional sub-scores (설정된 난이도 기준표 적용)
-    const clamp = (val: number) => Math.min(100, Math.max(10, Math.round(val)));
-    const speed = calculate_speed_score(avg_time_st1, ageGroup, StageId.CAN_CRUSH, difficulty);
+    // Multi-dimensional sub-scores (설정된 난이도 기준표 적용 및 30점 하한선 절대 방어)
+    const clamp = (val: number) => Math.min(100, Math.max(30, Math.round(val)));
+    const speed = Math.max(30, calculate_speed_score(avg_time_st1, ageGroup, StageId.CAN_CRUSH, difficulty));
     const power = clamp((success_count_st2 / Math.max(1, settings[StageId.EXTINGUISH_FIRE].targetCount * 0.8)) * 100);
     const accuracy = clamp(totalAccuracy);
-    const memory = clamp((max_level_st4 / Math.max(1, settings[StageId.MEMORY_SEQUENCE].targetCount)) * 100);
-    const brain = calculate_speed_score(avg_time_st5, ageGroup, StageId.MIND_CRASH, difficulty);
+
+    // 4단계 순서 기억력: 유아/초등 및 60대 이상 고령층은 Lv.3 성공 시 100점 만점 통과, 나머지는 Lv.5
+    const targetLevel_st4 = get_stage4_target_level(ageGroup);
+    const memory = clamp((Math.min(targetLevel_st4, max_level_st4) / targetLevel_st4) * 100);
+
+    const brain = Math.max(30, calculate_speed_score(avg_time_st5, ageGroup, StageId.MIND_CRASH, difficulty));
     const stability = clamp(100 - (time_gap * 20));
 
     const chartScores = [
@@ -138,8 +151,9 @@ export const Report: React.FC<Props> = ({
       { subject: '안정성(리듬)', value: stability, fullMark: 100 },
     ];
 
-    // 종합 분석 점수: 6개 전신 반응/인지 도메인의 종합 평균 점수
-    const speedScore = Number((chartScores.reduce((acc, s) => acc + s.value, 0) / chartScores.length).toFixed(1));
+    // 종합 분석 점수: 6개 전신 반응/인지 도메인의 종합 평균 점수 (최소 30점 방어)
+    const rawSpeedScore = chartScores.reduce((acc, s) => acc + s.value, 0) / chartScores.length;
+    const speedScore = Math.max(30.0, Number(rawSpeedScore.toFixed(1)));
     const grade = get_grade(speedScore);
 
     // Estimated Biological Reaction Age
@@ -246,6 +260,57 @@ export const Report: React.FC<Props> = ({
     }
   };
 
+  const handleExportCSV = () => {
+    const success = storageService.exportToCSV();
+    if (success) {
+      setDownloaded(true);
+      setTimeout(() => setDownloaded(false), 3000);
+    }
+  };
+
+  React.useEffect(() => {
+    if (!hasSavedRef.current && reportData) {
+      hasSavedRef.current = true;
+      const targetLevel_st4 = get_stage4_target_level(ageGroup);
+
+      const saved = storageService.saveRecord({
+        ageGroup: benchmark.name,
+        ageSpan: benchmark.ageSpan,
+        difficulty: diffOption.label,
+        totalScore: reportData.speedScore,
+        grade: reportData.grade,
+        overallTRT: Number(reportData.overallReactionTime.toFixed(2)),
+        bestReactionTime: Number(reportData.bestReactionTime.toFixed(2)),
+        totalAccuracy: Number(reportData.totalAccuracy.toFixed(1)),
+        biologicalAge: reportData.biologicalAgeGroup,
+        stage1_name: reportData.stages.st1.name,
+        stage1_reactionTime: Number(reportData.stages.st1.avg.toFixed(2)),
+        stage1_score: reportData.stages.st1.score,
+        stage2_name: reportData.stages.st2.name,
+        stage2_score: reportData.stages.st2.score,
+        stage3_name: reportData.stages.st3.name,
+        stage3_reactionTime: Number(reportData.stages.st3.avg.toFixed(2)),
+        stage3_score: reportData.stages.st3.score,
+        stage4_name: reportData.stages.st4.name,
+        stage4_reachedLevel: reportData.stages.st4.maxLevel,
+        stage4_targetLevel: targetLevel_st4,
+        stage4_score: reportData.stages.st4.score,
+        stage5_name: reportData.stages.st5.name,
+        stage5_reactionTime: Number(reportData.stages.st5.avg.toFixed(2)),
+        stage5_score: reportData.stages.st5.score,
+        radar_speed: reportData.scores.find(s => s.subject.includes('순발력'))?.value || 30,
+        radar_power: reportData.scores.find(s => s.subject.includes('민첩성'))?.value || 30,
+        radar_accuracy: reportData.scores.find(s => s.subject.includes('정확성'))?.value || 30,
+        radar_memory: reportData.scores.find(s => s.subject.includes('기억력'))?.value || 30,
+        radar_brain: reportData.scores.find(s => s.subject.includes('인지력'))?.value || 30,
+        radar_stability: reportData.scores.find(s => s.subject.includes('안정성'))?.value || 30,
+      });
+
+      setSavedRecord(saved);
+      setCumulativeCount(storageService.getRecordCount());
+    }
+  }, [reportData, benchmark, diffOption, ageGroup]);
+
   const gradeInfo = GRADE_DETAILS[reportData.grade];
 
   return (
@@ -263,6 +328,9 @@ export const Report: React.FC<Props> = ({
             </span>
             <span className="text-amber-300 font-bold text-[10px] bg-amber-500/10 px-2 py-0.5 rounded-full border border-amber-500/30">
               ✓ 2회차부터 정밀 측정 반영
+            </span>
+            <span className="text-emerald-300 font-bold text-[10px] bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/30">
+              ✓ 점수 하한 30점 방어
             </span>
           </div>
           <h2 className="text-xl md:text-2xl font-black orbitron italic text-white tracking-wide">
@@ -303,6 +371,45 @@ export const Report: React.FC<Props> = ({
             <Layers size={13} /> 단계별 상세
           </button>
         </div>
+      </div>
+
+      {/* Offline Storage Status Banner */}
+      <div className="my-2 px-3.5 py-2.5 rounded-xl border border-emerald-500/40 bg-emerald-500/10 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2.5 text-xs font-bold orbitron shrink-0 shadow-inner">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <div className="p-1.5 rounded-lg bg-emerald-500/20 text-emerald-400 shrink-0">
+            <HardDrive size={18} />
+          </div>
+          <div className="truncate">
+            <div className="flex items-center gap-2">
+              <span className="text-emerald-300 font-black">
+                💾 오프라인 로컬 저장 완료 {savedRecord ? `(기록 #${savedRecord.id})` : ''}
+              </span>
+              <span className="px-2 py-0.5 rounded-full bg-slate-800 text-amber-300 border border-slate-700 text-[10px] font-black">
+                총 {cumulativeCount}명 누적
+              </span>
+            </div>
+            <p className="text-[11px] font-medium text-slate-400 mt-0.5">
+              행사장 인터넷 없이도 브라우저에 안전 보관 중 • 언제든 엑셀 .csv로 다운로드 가능 (단축키: Ctrl+Shift+D)
+            </p>
+          </div>
+        </div>
+        <button
+          onClick={handleExportCSV}
+          className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-emerald-500 to-sky-500 hover:from-emerald-400 hover:to-sky-400 text-slate-950 font-black rounded-lg text-xs orbitron active:scale-95 transition-all shadow-md cursor-pointer"
+          title="지금까지 누적된 모든 참가자 데이터를 엑셀에서 열 수 있는 .csv 파일로 다운로드합니다"
+        >
+          {downloaded ? (
+            <>
+              <CheckCircle2 size={14} className="text-slate-950" />
+              <span>다운로드 완료!</span>
+            </>
+          ) : (
+            <>
+              <Download size={14} />
+              <span>엑셀 CSV 다운로드</span>
+            </>
+          )}
+        </button>
       </div>
 
       {/* Hero Grade Banner */}
@@ -738,6 +845,24 @@ export const Report: React.FC<Props> = ({
             <User size={16} className="text-sky-400" /> 연령 변경
           </button>
         )}
+
+        <button 
+          onClick={handleExportCSV}
+          className="flex items-center justify-center gap-1.5 bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2.5 rounded-xl font-bold text-xs md:text-sm orbitron border border-emerald-500 hover:border-emerald-400 transition-all active:scale-95 cursor-pointer shadow-md"
+          title="모든 참가자 데이터를 엑셀 .csv로 다운로드합니다"
+        >
+          {downloaded ? (
+            <>
+              <CheckCircle2 size={16} className="text-white" />
+              <span className="font-bold">다운로드 완료!</span>
+            </>
+          ) : (
+            <>
+              <Download size={16} />
+              <span>CSV 다운로드 ({cumulativeCount}명)</span>
+            </>
+          )}
+        </button>
 
         <button 
           onClick={handleCopyReport}

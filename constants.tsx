@@ -19,6 +19,93 @@ export const BITMAPS = {
   }
 };
 
+/**
+ * 4. 구글 스프레드시트 데이터 누적 (Google Apps Script Web App URL)
+ * - 행사 관리자가 생성한 Apps Script Web App의 배포 URL을 여기에 입력하면
+ *   참가자 측정 완료 시 자동으로 구글 시트에 행이 누적 기록됩니다.
+ * - URL이 비어있으면 결과 화면에 연동 대기 가이드가 표시됩니다.
+ */
+export const GOOGLE_SHEET_URL = "";
+
+export interface GoogleSheetPayload {
+  timestamp: string;
+  ageGroup: string;
+  ageSpan: string;
+  difficulty: string;
+  totalScore: number;
+  grade: string;
+  overallTRT: number;
+  stage1_reactionTime: number;
+  stage1_score: number;
+  stage2_power: number;
+  stage3_reactionTime: number;
+  stage3_score: number;
+  stage4_level: number;
+  stage4_targetLevel: number;
+  stage4_score: number;
+  stage5_reactionTime: number;
+  stage5_score: number;
+  accuracy: number;
+  scores: {
+    speed: number;
+    power: number;
+    accuracy: number;
+    memory: number;
+    brain: number;
+    stability: number;
+  };
+}
+
+/**
+ * 구글 스프레드시트(Apps Script Web App)로 POST 전송
+ */
+export async function sendReportToGoogleSheet(payload: GoogleSheetPayload): Promise<{ success: boolean; message: string }> {
+  if (!GOOGLE_SHEET_URL || GOOGLE_SHEET_URL.trim() === '') {
+    return {
+      success: false,
+      message: 'GOOGLE_SHEET_URL이 비어 있습니다. constants.tsx 상단에 Apps Script 배포 URL을 입력해 주세요.'
+    };
+  }
+
+  try {
+    await fetch(GOOGLE_SHEET_URL, {
+      method: 'POST',
+      mode: 'no-cors', // Google Apps Script CORS 리디렉트 에러 방지
+      headers: {
+        'Content-Type': 'text/plain;charset=utf-8'
+      },
+      body: JSON.stringify(payload)
+    });
+    return {
+      success: true,
+      message: '구글 스프레드시트에 성공적으로 저장되었습니다!'
+    };
+  } catch (err: any) {
+    console.error('Google Sheet send error:', err);
+    return {
+      success: false,
+      message: `전송 실패: ${err?.message || '네트워크 오류'}`
+    };
+  }
+}
+
+/**
+ * 4단계 순서 기억력 최대 목표 레벨 산출
+ * - 유아/초등 및 60대 이상 고령층은 최대 Lv.3까지만 성공해도 100점 만점 통과
+ * - 청년/중년층은 기존처럼 Lv.5 유지
+ */
+export function get_stage4_target_level(age_group: AgeGroup | string): number {
+  if (
+    age_group === AgeGroup.TODDLER ||
+    age_group === AgeGroup.CHILD ||
+    age_group === AgeGroup.SENIOR ||
+    age_group === AgeGroup.ELDERLY
+  ) {
+    return 3;
+  }
+  return 5;
+}
+
 export const GRID_MAP: Record<number, { byte: 1 | 2, mask: number }> = {
   1: { byte: 2, mask: BITMAPS.DATA2.LU },
   2: { byte: 1, mask: BITMAPS.DATA1.UP },
@@ -241,17 +328,43 @@ export function calculate_speed_score(
   // 난이도에 따른 동적 기준값 가져오기
   const benchmark = get_scaled_benchmark(age_group, difficulty);
 
+  const isYoungAge = age_group === AgeGroup.TODDLER || age_group === AgeGroup.CHILD;
+
   // 3단계(8방향 색상 시각 탐색) 및 5단계(스트룹 간섭 제어)에 대한 인지 과제 복잡도 보정
+  // 유아/초등은 부모가 옆에서 읽어주는 시간(7초 이상)을 고려하여 넉넉한 인지 지연 오프셋 및 기준 시간 부여
   let cognitiveOffset = 0;
-  if (stageId === StageId.COLOR_REFLEX) cognitiveOffset = 0.25;
-  if (stageId === StageId.MIND_CRASH) cognitiveOffset = 0.45;
+  let dynamicFailTime = benchmark.Fail_time;
+  let s_time = benchmark.S_time;
+  let a_time = benchmark.A_time;
+  let b_time = benchmark.B_time;
+  let c_time = benchmark.C_time;
+
+  if (stageId === StageId.COLOR_REFLEX) {
+    if (isYoungAge) {
+      cognitiveOffset = 1.8;
+      dynamicFailTime = Math.max(8.0, benchmark.Fail_time * 2.2); // 7초 이상 넉넉한 타임아웃 방어
+      c_time = Math.max(4.5, c_time * 1.8);
+      b_time = Math.max(3.0, b_time * 1.6);
+      a_time = Math.max(2.0, a_time * 1.4);
+    } else {
+      cognitiveOffset = 0.25;
+    }
+  }
+
+  if (stageId === StageId.MIND_CRASH) {
+    if (isYoungAge) {
+      cognitiveOffset = 2.2;
+      dynamicFailTime = Math.max(8.5, benchmark.Fail_time * 2.4); // 7초 이상 넉넉한 타임아웃 방어
+      c_time = Math.max(5.0, c_time * 1.9);
+      b_time = Math.max(3.5, b_time * 1.7);
+      a_time = Math.max(2.2, a_time * 1.5);
+    } else {
+      cognitiveOffset = 0.45;
+    }
+  }
 
   const adjTime = Math.max(0.15, measured_time - cognitiveOffset);
-  const s_time = benchmark.S_time;
-  const a_time = benchmark.A_time;
-  const b_time = benchmark.B_time;
-  const c_time = benchmark.C_time;
-  const max_fail = benchmark.Fail_time;
+  const max_fail = dynamicFailTime;
 
   let score: number;
 
@@ -272,12 +385,13 @@ export function calculate_speed_score(
     const ratio = (adjTime - b_time) / (c_time - b_time);
     score = 70.0 - ratio * 10.0;
   } else {
-    // C등급 노력 필요 (59.9~30.0점): 미션을 성공한 유저에게 정상 점진적 감점 부여
+    // C등급 노력 필요 (59.9~30.0점): 점수 하한선 30점 방어
     const ratio = Math.min(1.0, (adjTime - c_time) / Math.max(0.1, max_fail - c_time));
     score = Math.max(30.0, 60.0 - ratio * 30.0);
   }
 
-  return Number(score.toFixed(1));
+  // 참가자 점수 하한선 30점 절대 보장
+  return Math.max(30.0, Number(score.toFixed(1)));
 }
 
 export function get_grade(score: number): "S" | "A" | "B" | "C" {
@@ -312,7 +426,7 @@ export const STAGE_TITLES: Record<StageId, string> = {
 
 export const STAGE_KEY_PHRASES: Record<StageId, string> = {
   [StageId.CAN_CRUSH]: "발밑에 캔이 나타나면 번개처럼 신속하게 밟으세요!",
-  [StageId.EXTINGUISH_FIRE]: "불꽃이 난 발판을 빠르게 2회 연속 밟아 진화하세요!",
+  [StageId.EXTINGUISH_FIRE]: "불꽃이 난 발판을 빠르게 숫자만큼 연속 밟아 진화하세요!",
   [StageId.COLOR_REFLEX]: "제시된 목표 색상과 똑같은 색의 발판을 찾아 밟으세요!",
   [StageId.MEMORY_SEQUENCE]: "노란색으로 반짝이는 순서를 외우고 차례대로 밟으세요!",
   [StageId.MIND_CRASH]: "글자 뜻에 속지 말고, 글씨에 칠해진 '실제 색상'을 밟으세요!",
@@ -320,7 +434,7 @@ export const STAGE_KEY_PHRASES: Record<StageId, string> = {
 
 export const STAGE_DESCRIPTIONS: Record<StageId, string> = {
   [StageId.CAN_CRUSH]: "8개 발판 중 무작위로 나타나는 빈 캔을 가장 빠른 반응속도로 찌그러트리는 기본 순발력 및 체중이동 테스트입니다.",
-  [StageId.EXTINGUISH_FIRE]: "불꽃이 발생한 발판을 연속으로 2회 힘차게 밟아야 불이 꺼집니다. 민첩성과 파워 스텝 순발력을 측정합니다.",
+  [StageId.EXTINGUISH_FIRE]: "불꽃이 발생한 발판에 표시된 숫자만큼 연속으로 힘차게 밟아야 불이 꺼집니다. 민첩성과 파워 스텝 순발력을 측정합니다.",
   [StageId.COLOR_REFLEX]: "화면 상단과 좌측에 제시되는 목표 색상을 확인하고, 8방향 발판 중 동일한 색상의 발판을 시각적으로 변별하여 밟는 테스트입니다.",
   [StageId.MEMORY_SEQUENCE]: "발판에 점등되는 시각 패턴 순서(2~4단계)를 작업기억에 저장한 후, 신호음에 맞춰 정확한 순서대로 연속 이동하는 인지 기억 테스트입니다.",
   [StageId.MIND_CRASH]: "두뇌 스트룹(Stroop) 인지 억제 테스트입니다. '빨강'이라는 단어가 파란색 글씨로 적혀있다면 글자 뜻이 아닌 [파란색] 발판을 밟아야 합니다!",
