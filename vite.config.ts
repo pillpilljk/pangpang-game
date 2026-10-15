@@ -5,6 +5,7 @@ import react from '@vitejs/plugin-react';
 export default defineConfig(({ mode }) => {
     const env = loadEnv(mode, '.', '');
     return {
+      base: '/pangpang-game/', // <--- 깃허브 페이지 배포를 위해 이 줄이 추가되었습니다.
       server: {
         port: 3000,
         host: '0.0.0.0',
