@@ -1,0 +1,8 @@
+{
+  "name": "PangPang Board Pro: Reaction Master",
+  "description": "An advanced reaction time training game for the 3x3 PangPang pressure sensor board, featuring 5 specialized training stages and detailed performance analytics.",
+  "requestFramePermissions": [
+    "serial"
+  ],
+  "majorCapabilities": []
+}
